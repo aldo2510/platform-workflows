@@ -1,0 +1,146 @@
+name: Reusable - Deploy Azure Container Apps
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: Short project name used for Azure resource naming and Terraform state key
+        required: true
+        type: string
+      azure_deployer_object_id:
+        description: Object ID of the Azure Service Principal
+        required: true
+        type: string
+      location:
+        description: Azure region
+        required: false
+        type: string
+        default: eastus
+      state_resource_group:
+        description: Existing resource group containing Terraform state storage
+        required: true
+        type: string
+      state_storage_account:
+        description: Existing Azure Storage account for Terraform state
+        required: true
+        type: string
+      state_container:
+        description: Existing blob container for Terraform state
+        required: true
+        type: string
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_CLIENT_SECRET:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: golden-path-${{ inputs.project_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: "false"
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_project_name: ${{ inputs.project_name }}
+      TF_VAR_location: ${{ inputs.location }}
+      TF_VAR_azure_deployer_object_id: ${{ inputs.azure_deployer_object_id }}
+      TF_VAR_azure_subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure with Service Principal + Client Secret
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Validate required inputs
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+        run: |
+          set -euo pipefail
+          [[ "$PROJECT_NAME" =~ ^[a-zA-Z][a-zA-Z0-9-]{2,19}$ ]] || { echo "Project name must be 3-20 characters and start with a letter."; exit 1; }
+          test -d app
+          test -d terraform
+          : "${{ inputs.state_resource_group }}"
+          : "${{ inputs.state_storage_account }}"
+          : "${{ inputs.state_container }}"
+
+      - name: Terraform init and validate
+        working-directory: terraform
+        env:
+          STATE_RESOURCE_GROUP: ${{ inputs.state_resource_group }}
+          STATE_STORAGE_ACCOUNT: ${{ inputs.state_storage_account }}
+          STATE_CONTAINER: ${{ inputs.state_container }}
+          PROJECT_NAME: ${{ inputs.project_name }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$STATE_CONTAINER" \
+            -backend-config="key=$PROJECT_NAME.tfstate" \
+            -backend-config="use_cli=true" \
+            -backend-config="use_azuread_auth=true"
+          terraform fmt -check
+          terraform validate
+
+      - name: Provision base infrastructure
+        working-directory: terraform
+        run: |
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+
+      - name: Read ACR name
+        id: acr
+        working-directory: terraform
+        run: echo "name=$(terraform output -raw acr_name)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push app image with ACR Tasks
+        run: |
+          az acr build \
+            --registry "${{ steps.acr.outputs.name }}" \
+            --image "golden-path-app:${{ github.sha }}" \
+            ./app
+
+      - name: Apply application image
+        working-directory: terraform
+        env:
+          IMAGE_NAME: ${{ steps.acr.outputs.name }}.azurecr.io/golden-path-app:${{ github.sha }}
+        run: |
+          sleep 20
+          terraform plan -out=tfplan -var="image_name=$IMAGE_NAME"
+          terraform apply -auto-approve tfplan
+
+      - name: Publish deployment URL
+        working-directory: terraform
+        run: |
+          echo "## Golden Path deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application URL: $(terraform output -raw container_app_url)" >> "$GITHUB_STEP_SUMMARY"
